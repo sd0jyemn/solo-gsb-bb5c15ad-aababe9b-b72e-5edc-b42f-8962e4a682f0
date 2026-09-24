@@ -255,10 +255,11 @@ function renderResult(record) {
   sum.innerHTML = r.summary;
   $("btnExport").disabled = false;
   $("btnCopy").disabled = false;
-  // 误差校核/振动校准/逐管装载只针对已保存方案: 未保存(草稿)时禁用
+  // 误差校核/振动校准/逐管装载/应急迁移只针对已保存方案: 未保存(草稿)时禁用
   $("btnWeighing").disabled = !(record.id !== null && record.id !== undefined);
   $("btnCalib").disabled = !(record.id !== null && record.id !== undefined);
   $("btnLoading").disabled = !(record.id !== null && record.id !== undefined);
+  $("btnReloc").disabled = !(record.id !== null && record.id !== undefined);
 
   drawRotor(r);
   renderPairs(r);
@@ -480,6 +481,7 @@ async function renderHistory() {
         <button class="iconbtn" data-a="weigh">误差校核</button>
         <button class="iconbtn" data-a="calib">振动校准</button>
         <button class="iconbtn" data-a="loadseq">安全装载</button>
+        <button class="iconbtn" data-a="reloc">应急迁移</button>
         <button class="iconbtn" data-a="export">导出</button>
         <button class="iconbtn" data-a="del">删除</button>
       </div>`;
@@ -499,6 +501,7 @@ async function renderHistory() {
     d.querySelector('[data-a="weigh"]').onclick = () => openWeighingDialog(it.id);
     d.querySelector('[data-a="calib"]').onclick = () => openCalibDialog(it.id);
     d.querySelector('[data-a="loadseq"]').onclick = () => openLoadingDialog(it.id);
+    d.querySelector('[data-a="reloc"]').onclick = () => openRelocDialog(it.id);
     d.querySelector('[data-a="export"]').onclick = () => { window.location = `/api/plan/${it.id}/export`; };
     d.querySelector('[data-a="del"]').onclick = async () => {
       if (!confirm(`删除方案 #${it.id}?`)) return;
@@ -1191,6 +1194,145 @@ $("btnLoading").onclick = () => {
   }
 };
 $("btnCloseLoading").onclick = () => $("loadingDialog").classList.remove("open");
+
+// ---------------------------------------------------------------------------
+// 失效槽位应急迁移(只读, 基于已保存方案; 有界精确枚举)
+// ---------------------------------------------------------------------------
+const rlState = { planId: null, slots: [] };
+
+async function openRelocDialog(id) {
+  $("btnReloc")?.blur();
+  try {
+    const resp = await fetch(`/api/plan/${id}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "方案读取失败");
+    rlState.planId = id;
+    const placed = data.result.placements
+      .filter((p) => p.slot !== null && p.slot !== undefined);
+    const occBy = new Map(placed.map((p) => [p.slot, p]));
+    const enabled = data.result.slot_state
+      .filter((s) => s.enabled)
+      .map((s) => ({ slot: s.slot, angle: s.angle, occ: occBy.get(s.slot) || null }))
+      .sort((a, b) => a.slot - b.slot);
+    rlState.slots = enabled;
+    const tooManyTubes = placed.length > 10;
+    const tooManySlots = enabled.length > 16;
+    $("relocMeta").innerHTML =
+      `方案 <b>#${data.id} ${data.name}</b> · ${new Date(data.created_at).toLocaleString()} ·
+       R=${data.request.radius_mm}mm · ${placed.length} 支已放置试管 · 启用槽 ${enabled.length} 个 ·
+       标称 |U₁|=${fmt(data.result.metrics.u1_mag_g_mm)} g·mm` +
+      ((tooManyTubes || tooManySlots)
+        ? ' · <span class="wc-hi">超出应急迁移适用范围(≤10 支管, ≤16 启用槽), 服务端将拒绝</span>'
+        : "");
+    const sel = $("rlFailedSlot");
+    sel.innerHTML = enabled.map((s) => {
+      const tag = s.occ
+        ? `占用: 试管 ${s.occ.tube_id}${s.occ.locked ? "(锁定)" : ""}`
+        : "空置";
+      return `<option value="${s.slot}">#${s.slot} (${fmt(s.angle, 1)}°) ${tag}</option>`;
+    }).join("");
+    // 默认选中第一个被非锁定试管占用的槽位(最典型的失效场景)
+    const def = enabled.find((s) => s.occ && !s.occ.locked) || enabled[0];
+    if (def) sel.value = String(def.slot);
+    $("rlLimit").value = "";
+    $("rlMaxMoves").value = "3";
+    $("relocResult").innerHTML = "";
+    $("btnRlRun").disabled = !placed.length || tooManyTubes || tooManySlots;
+    $("relocDialog").classList.add("open");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+$("btnRlRun").onclick = async () => {
+  const btn = $("btnRlRun");
+  btn.disabled = true;
+  try {
+    const lim = parseFloat($("rlLimit").value);
+    if (isNaN(lim) || !Number.isFinite(lim) || lim < 0) {
+      toast("请填写非负的一阶不平衡量限值。", true);
+      return;
+    }
+    const body = {
+      failed_slot: parseInt($("rlFailedSlot").value, 10),
+      u1_limit_g_mm: lim,
+      max_moves: parseInt($("rlMaxMoves").value, 10),
+    };
+    const resp = await fetch(`/api/plan/${rlState.planId}/emergency-relocation`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "应急迁移规划失败");
+    renderRelocResult(data);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+function renderRelocResult(d) {
+  const box = $("relocResult");
+  const u1Txt = (b) => `${fmt(b.u1_mag_g_mm)} g·mm @${fmt(b.u1_angle_deg, 1)}°`;
+  const footer = `<div class="small" style="margin-top:6px">算法: ${d.method};
+    共评估 ${d.assignments_evaluated} 种候选摆放。${d.note} 方案 #${d.plan.id} 未被修改。</div>`;
+  if (!d.feasible) {
+    const best = d.best_achievable
+      ? `<div class="wc-note">参考: 移动上限内可达到的最小 |U₁| 为
+          <b>${fmt(d.best_achievable.u1_mag_g_mm)}</b> g·mm
+          (移动 ${d.best_achievable.move_count} 支), 仍超过限值
+          ${fmt(d.u1_limit_g_mm)} g·mm; 可放宽限值或提高移动上限后重试。</div>`
+      : "";
+    box.innerHTML = `
+      <div class="wc-bad">✘ <b>无可行摆放</b>: ${d.reason}</div>
+      ${best}
+      ${footer}`;
+    return;
+  }
+  const movesTxt = d.moves.length
+    ? d.moves.map((mv) =>
+        `<span class="badge">试管 ${mv.tube_id}: 槽 ${mv.from_slot} → 槽 ${mv.to_slot}</span>`).join(" ")
+    : '<span class="small">无需移动任何试管(失效槽位原为空置, 当前布局已满足限值)。</span>';
+  const tie = d.optimal_assignment_count > 1
+    ? `达到最少移动数且 |U₁| 最小的摆放共 <b>${d.optimal_assignment_count}</b> 种, 已按管号升序的目标槽位序列裁决。`
+    : "达到最少移动数且 |U₁| 最小的摆放唯一。";
+  const rows = d.tubes.map((t) => {
+    const st = t.locked
+      ? '<span class="pill lock">锁定</span>'
+      : t.moved
+        ? '<span class="pill move">已移动</span>'
+        : '<span class="status-tag st-unchanged">未动</span>';
+    return `<tr${t.moved ? ' style="background:#3a2a1255"' : ""}>
+      <td>${t.tube_id}</td>
+      <td>${fmt(t.mass_g, 3)}</td>
+      <td>${t.original_slot} <span class="small">(${fmt(t.original_angle_deg, 1)}°)</span></td>
+      <td>${t.target_slot} <span class="small">(${fmt(t.target_angle_deg, 1)}°)</span></td>
+      <td>${st}</td>
+    </tr>`;
+  }).join("");
+  box.innerHTML = `
+    <div class="wc-ok">✔ <b>可行</b>: 移动 <b>${d.move_count}</b> 支试管(上限 ${d.max_moves}),
+      最终 |U₁|=${fmt(d.final_u1.u1_mag_g_mm)} g·mm ≤ 限值 ${fmt(d.u1_limit_g_mm)} g·mm,
+      余量 ${fmt(d.margin_g_mm)} g·mm; 失效槽位 #${d.failed_slot} 已腾空。</div>
+    <div class="rowline" style="flex-wrap:wrap;gap:6px;margin:6px 0">
+      <span class="small">迁移:</span>${movesTxt}</div>
+    <div class="wc-note">${tie} 原 |U₁|=${u1Txt(d.original_u1)} → 最终 |U₁|=${u1Txt(d.final_u1)}。</div>
+    <table class="cmp-table wc-table">
+      <thead><tr><th>试管</th><th>质量(g)</th><th>原槽 / 角度</th><th>目标槽 / 角度</th><th>状态</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    ${footer}`;
+}
+
+$("btnReloc").onclick = () => {
+  if (state.record && state.record.id !== null && state.record.id !== undefined) {
+    openRelocDialog(state.record.id);
+  } else {
+    toast("请先从历史方案载入一条已保存方案, 或先计算并保存方案。", true);
+  }
+};
+$("btnCloseReloc").onclick = () => $("relocDialog").classList.remove("open");
 
 // ---------------------------------------------------------------------------
 // 标签页 & 初始化

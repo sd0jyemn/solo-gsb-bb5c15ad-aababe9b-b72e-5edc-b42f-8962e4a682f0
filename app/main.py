@@ -20,6 +20,7 @@ from .batch import plan_batch_sequence
 from .calibration import predict_single_weight_balancing
 from .compare import compare_plans
 from .loading import plan_loading_sequence
+from .relocation import plan_emergency_relocation
 from .weighing import worst_case_u1
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -120,6 +121,15 @@ class BatchSequenceRequest(BaseModel):
 class LoadingSequenceRequest(BaseModel):
     # 装载阶段一阶不平衡量限值(g·mm), 可空; 非空时必须非负
     u1_limit_g_mm: Optional[float] = Field(default=None, ge=0)
+
+
+class EmergencyRelocationRequest(BaseModel):
+    # 新失效槽位槽号; 必须是方案中的启用槽位, 迁移后不得占用
+    failed_slot: int
+    # 一阶不平衡量限值(g·mm), 迁移后 |U₁| 不得超过该值; 必填且非负
+    u1_limit_g_mm: float = Field(ge=0)
+    # 最多可移动管数(0~3); 锁定试管不得移动, 不计入移动数
+    max_moves: int = Field(ge=0, le=3)
 
 
 class PlanRequest(BaseModel):
@@ -460,6 +470,30 @@ def loading_sequence(plan_id: int, req: LoadingSequenceRequest) -> dict[str, Any
     plan = _row_to_plan(_load_plan_row(plan_id))
     try:
         return plan_loading_sequence(plan, u1_limit_g_mm=req.u1_limit_g_mm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/plan/{plan_id}/emergency-relocation")
+def emergency_relocation(plan_id: int, req: EmergencyRelocationRequest) -> dict[str, Any]:
+    """对已保存方案生成失效槽位应急迁移建议(只读): 失效槽位腾空, 最少移动。
+
+    基于方案中的标称质量、槽位角度与半径, 用有界精确枚举(移动数 0..K
+    递增, 组合 × 单射指派)在移动上限内精确寻找满足一阶不平衡量限值的
+    摆放: 锁定试管不得移动, 失效槽位不得占用; 先使移动管数最少, 再使
+    最终 |U₁| 最小, 并列按管号升序的目标槽位序列裁决。逐管返回原槽/
+    目标槽、移动数与最终 |U₁|; 无可行摆放时明确说明并给出上限内可达
+    最小 |U₁|。仅接受至多 10 支已放置试管、16 个启用槽位、移动上限
+    0~3 的方案(超出明确拒绝)。结果不保存、不覆盖原方案。
+    """
+    plan = _row_to_plan(_load_plan_row(plan_id))
+    try:
+        return plan_emergency_relocation(
+            plan,
+            failed_slot=req.failed_slot,
+            u1_limit_g_mm=req.u1_limit_g_mm,
+            max_moves=req.max_moves,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

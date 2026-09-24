@@ -205,6 +205,7 @@ th{color:var(--mut);font-weight:500}
       <button id="btnWeighing" disabled title="对已保存方案做称重误差校核(只读)">称重误差校核</button>
       <button id="btnCalib" disabled title="对已保存方案做实测振动校准(只读, 影响系数法)">实测振动校准</button>
       <button id="btnLoading" disabled title="对已保存方案规划逐管安全装载次序(只读, 子集动态规划)">逐管安全装载</button>
+      <button id="btnReloc" disabled title="对已保存方案生成失效槽位应急迁移建议(只读, 有界精确枚举)">失效槽位应急迁移</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
     </div>
@@ -388,6 +389,44 @@ th{color:var(--mut);font-weight:500}
       </div>
     </div>
     <div id="loadingResult" style="margin-top:6px"></div>
+  </div>
+</div>
+
+<div id="relocDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">失效槽位应急迁移</h2><div style="flex:1"></div>
+      <button id="btnCloseReloc" class="ghost">关闭</button></div>
+    <div class="wc-note">某个启用槽位突然失效时, 基于该方案的标称质量、槽角与半径生成<b>只读</b>迁移建议:
+      <b>锁定试管不得移动, 失效槽位不得占用</b>。服务端在移动管数上限内做<b>有界精确枚举</b>
+      (移动数 0..K 递增, 组合 × 单射指派), 先使移动管数最少, 再使最终 |U₁| 最小,
+      并列时按管号升序的目标槽位序列裁决; 逐管给出原槽/目标槽、移动数与最终 |U₁|,
+      无可行摆放时明确说明。仅接受 ≤10 支已放置试管、≤16 个启用槽位、移动上限 0~3 的方案。
+      结果不保存、不覆盖原方案。</div>
+    <div id="relocMeta" class="small" style="margin:4px 0 8px"></div>
+    <div class="grid3" style="gap:10px;margin-bottom:8px">
+      <div>
+        <label>新失效槽位(迁移后不得占用)</label>
+        <select id="rlFailedSlot"></select>
+      </div>
+      <div>
+        <label>一阶不平衡量限值 |U₁| (g·mm)</label>
+        <input id="rlLimit" type="number" min="0" step="any" placeholder="例如 1000">
+      </div>
+      <div>
+        <label>最多可移动管数(0~3)</label>
+        <select id="rlMaxMoves">
+          <option value="0">0</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3" selected>3</option>
+        </select>
+      </div>
+    </div>
+    <div class="rowline">
+      <button id="btnRlRun" class="primary">生成迁移建议</button>
+      <span class="small">只读操作, 不会修改或覆盖历史方案。</span>
+    </div>
+    <div id="relocResult" style="margin-top:6px"></div>
   </div>
 </div>
 

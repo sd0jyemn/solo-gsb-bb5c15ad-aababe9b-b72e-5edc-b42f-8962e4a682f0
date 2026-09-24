@@ -650,4 +650,116 @@ except main.HTTPException as e:
 # 只读: 规划后原方案指标不变
 assert call("GET", "/api/plan/2")["result"]["metrics"]["u1_mag_g_mm"] == m2
 print("loading-sequence validation/read-only OK")
+
+# ---- 失效槽位应急迁移(只读, 有界精确枚举) ----
+def er_call(plan_id, failed_slot, limit, max_moves):
+    found = find("POST", f"/api/plan/{plan_id}/emergency-relocation")
+    fn, args = (found if isinstance(found, tuple) else (found, ()))
+    req = types.SimpleNamespace(failed_slot=failed_slot,
+                                u1_limit_g_mm=limit, max_moves=max_moves)
+    return fn(*args, req)
+
+def _brute_reloc(plan, failed_slot, limit, max_moves):
+    """独立暴力参考: (feasible, moves, mag, seq); U₁ 每次从零复算。"""
+    res = plan["result"]; req = plan["request"]
+    R = float(res["config"]["radius_mm"])
+    geo = {int(s["index"]): (float(s["angle"]), bool(s["enabled"]))
+           for s in req["slots"]}
+    enabled = sorted(i for i, (_, e) in geo.items() if e)
+    tubes = [p for p in res["placements"] if p["slot"] is not None]
+    ids = sorted(int(p["tube_id"]) for p in tubes)
+    mass = {int(p["tube_id"]): float(p["mass"]) for p in tubes}
+    orig = {int(p["tube_id"]): int(p["slot"]) for p in tubes}
+    locked = {int(p["tube_id"]) for p in tubes if p.get("locked")}
+    movable = [i for i in ids if i not in locked]
+    occ = next((i for i in ids if orig[i] == failed_slot), None)
+    if occ is not None and occ in locked:
+        return (False, None, None, None)
+    def mag_of(final):
+        ux = uy = 0.0
+        for tid, s in final.items():
+            a = _math.radians(geo[s][0])
+            ux += mass[tid] * R * _math.cos(a)
+            uy += mass[tid] * R * _math.sin(a)
+        return _math.hypot(ux, uy)
+    tol = 1e-9 * max(1.0, limit)
+    for m in range(0, min(max_moves, len(movable)) + 1):
+        best_mag = None; best_seq = None
+        for combo in _it.combinations(movable, m):
+            if occ is not None and occ not in combo:
+                continue
+            stay = {t: s for t, s in orig.items() if t not in combo}
+            targets = [s for s in enabled
+                       if s != failed_slot and s not in stay.values()]
+            for assign in _it.permutations(targets, m):
+                if any(assign[i] == orig[combo[i]] for i in range(m)):
+                    continue
+                final = dict(stay); final.update(zip(combo, assign))
+                mg = mag_of(final)
+                if mg > limit + tol:
+                    continue
+                seq = tuple(final[t] for t in ids)
+                if best_mag is None or mg < best_mag - 1e-9 * max(1.0, best_mag):
+                    best_mag, best_seq = mg, seq
+                elif mg <= best_mag + 1e-9 * max(1.0, best_mag) and seq < best_seq:
+                    best_seq = seq
+        if best_seq is not None:
+            return (True, m, best_mag, best_seq)
+    return (False, None, None, None)
+
+# plan#2: 7 支试管(试管 5 锁定在槽 0), 槽 6 禁用, R=100
+plan2 = call("GET", "/api/plan/2")
+p2_slots = {int(p["tube_id"]): int(p["slot"])
+            for p in plan2["result"]["placements"]}
+p2_enabled = [s["index"] for s in plan2["request"]["slots"] if s["enabled"]]
+p2_occupied_free = [p2_slots[t] for t in sorted(p2_slots) if t != 5]  # 非锁定管占用槽
+p2_empty = [s for s in p2_enabled if s not in p2_slots.values()]
+er_cases = []
+for fs in [p2_occupied_free[0], p2_empty[0]]:
+    for lim in (0.0, 3000.0, 1e9):
+        for mmv in (0, 1, 2, 3):
+            er_cases.append((fs, lim, mmv))
+for fs, lim, mmv in er_cases:
+    r = er_call(2, fs, lim, mmv)
+    bf, bm, bmag, bseq = _brute_reloc(plan2, fs, lim, mmv)
+    assert r["feasible"] == bf, (fs, lim, mmv, r.get("reason"))
+    if not bf:
+        assert r["final_u1"] is None and r["reason"]
+        continue
+    assert r["move_count"] == bm and r["move_count"] <= mmv
+    assert abs(r["final_u1"]["u1_mag_g_mm"] - bmag) < 1e-6 * max(1.0, bmag)
+    tg = {t["tube_id"]: t["target_slot"] for t in r["tubes"]}
+    assert tuple(tg[t] for t in sorted(tg)) == bseq, (fs, lim, mmv)
+    assert fs not in tg.values()                     # 失效槽位不得占用
+    assert tg[5] == p2_slots[5]                      # 锁定试管不得移动
+    assert sum(1 for t in r["tubes"] if t["moved"]) == r["move_count"]
+    assert len(r["moves"]) == r["move_count"]
+    assert r["final_u1"]["u1_mag_g_mm"] <= lim + 1e-6 * max(1.0, lim)
+    assert r["within_limit"] is True
+print("emergency-relocation %d cases vs brute force OK" % len(er_cases))
+
+# 失效槽被锁定试管(试管 5 @ 槽 0)占用 -> 无可行摆放(200, feasible=false)
+r_lock = er_call(2, 0, 1e9, 3)
+assert r_lock["feasible"] is False and "锁定" in r_lock["reason"]
+assert r_lock["best_achievable"] is None
+# 校验错误 -> 400: 移动上限越界 / 负限值 / 失效槽禁用(槽6) / 失效槽不存在
+for bad_args in ((2, p2_empty[0], 100.0, 5), (2, p2_empty[0], -1.0, 1),
+                 (2, 6, 100.0, 1), (2, 99, 100.0, 1)):
+    try:
+        er_call(*bad_args); raise SystemExit("should 400")
+    except main.HTTPException as e:
+        assert e.status_code == 400, (bad_args, e)
+# 超规模方案(17 支管 / 24 启用槽) -> 400 明确拒绝
+try:
+    er_call(recb["id"], 0, 100.0, 1); raise SystemExit("should 400")
+except main.HTTPException as e:
+    assert e.status_code == 400
+# 方案不存在 -> 404
+try:
+    er_call(999, 0, 100.0, 1); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+# 只读: 规划后原方案指标不变
+assert call("GET", "/api/plan/2")["result"]["metrics"]["u1_mag_g_mm"] == m2
+print("emergency-relocation validation/read-only OK")
 print("BACKEND SMOKE TESTS PASS")

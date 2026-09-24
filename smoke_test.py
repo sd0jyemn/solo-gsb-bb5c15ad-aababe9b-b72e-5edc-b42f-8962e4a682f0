@@ -650,4 +650,136 @@ except main.HTTPException as e:
 # 只读: 规划后原方案指标不变
 assert call("GET", "/api/plan/2")["result"]["metrics"]["u1_mag_g_mm"] == m2
 print("loading-sequence validation/read-only OK")
+
+# ---- 失效槽位应急迁移(只读, 按移动数分层完全枚举) ----
+def ev_route(plan_id):
+    found = find("POST", f"/api/plan/{plan_id}/slot-evacuation")
+    return (found if isinstance(found, tuple) else (found, ()))
+def ev_call(plan_id, failed, limit, max_moves):
+    fn, args = ev_route(plan_id)
+    req = types.SimpleNamespace(failed_slots=list(failed),
+                                u1_limit_g_mm=limit, max_moves=max_moves)
+    return fn(*args, req)
+
+# 确定性方案 A: 两支 50g 全部锁定在对径槽 0/6, 原 |U₁|=0
+ev_body = dict(req_body)
+ev_body["name"] = "应急迁移方案"
+ev_body["slots"] = [{"index": i, "angle": i * 30, "enabled": True}
+                    for i in range(12)]
+ev_body["tubes"] = [
+    {"id": 1, "mass": 50, "locked": True, "slot": 0},
+    {"id": 2, "mass": 50, "locked": True, "slot": 6},
+]
+recv = call("POST", "/api/plan", ev_body)
+evid = recv["id"]
+assert abs(recv["result"]["metrics"]["u1_mag_g_mm"]) < 1e-6
+# 空失效槽 + 限值 0 → 0 移动可行, 最终 |U₁|=0
+ev0 = ev_call(evid, [3], 0.0, 0)
+assert ev0["feasible"] is True and ev0["moves_required"] == 0
+assert abs(ev0["final_u1"]["u1_mag_g_mm"]) < 1e-7
+assert ev0["moves"] == []
+# 锁定管所在槽失效 → 结构性不可行, 无最终摆放
+evl = ev_call(evid, [0], 1e9, 3)
+assert evl["feasible"] is False and evl["final_u1"] is None
+assert [r["tube_id"] for r in evl["locked_on_failed_slots"]] == [1]
+print("slot-evacuation locked/empty cases OK")
+
+# 确定性方案 B: 管 1 锁定在槽 0, 管 2 自由(求解器置于对径槽, 原 |U₁|≈0)
+ev2_body = dict(ev_body)
+ev2_body["name"] = "应急迁移二"
+ev2_body["tubes"] = [
+    {"id": 1, "mass": 50, "locked": True, "slot": 0},
+    {"id": 2, "mass": 50},
+]
+recv2 = call("POST", "/api/plan", ev2_body)
+evid2 = recv2["id"]
+assert abs(recv2["result"]["metrics"]["u1_mag_g_mm"]) < 1e-6
+free_slot = next(p["slot"] for p in recv2["result"]["placements"]
+                 if p["tube_id"] == 2)
+# 失效槽为空且限值宽松 → 0 移动
+ev_f0 = ev_call(evid2, [9], 1e9, 3)
+assert ev_f0["feasible"] is True and ev_f0["moves_required"] == 0
+# 管 2 原槽失效 → 必须迁移; 大限值下 1 次移动即可, 管 1 锁定不动
+ev_f1 = ev_call(evid2, [free_slot], 1e9, 3)
+assert ev_f1["feasible"] is True and ev_f1["moves_required"] == 1
+mv = ev_f1["moves"][0]
+assert mv["tube_id"] == 2 and mv["from_slot"] == free_slot and mv["to_slot"] != free_slot
+row1 = next(t for t in ev_f1["tubes"] if t["tube_id"] == 1)
+assert row1["final_slot"] == 0 and row1["moved"] is False
+# 目标槽唯一且不占用失效槽
+targets = [t["final_slot"] for t in ev_f1["tubes"]]
+assert len(targets) == len(set(targets)) and free_slot not in targets
+# 最终 |U₁| 独立复算
+ux = uy = 0.0
+for t in ev_f1["tubes"]:
+    a = _math.radians(t["final_angle_deg"])
+    ux += t["mass_g"] * _math.cos(a)
+    uy += t["mass_g"] * _math.sin(a)
+assert abs(100.0 * _math.hypot(ux, uy) - ev_f1["final_u1"]["u1_mag_g_mm"]) < 1e-5
+# 限值 0、移动上限 0 且必须迁 1 支 → 不可行, 无对照摆放
+ev_bad = ev_call(evid2, [free_slot], 0.0, 0)
+assert ev_bad["feasible"] is False and ev_bad["best_effort"] is None
+assert ev_bad["forced_move_count"] == 1
+# 锁定管在槽 0 固定不动: 唯一可移动的管 2 必须回到对径槽 6 才能完全平衡,
+# 而槽 6 已失效 → 即使允许 3 支移动也无法达到限值 0
+ev_lock_no = ev_call(evid2, [free_slot], 0.0, 3)
+assert ev_lock_no["feasible"] is False and ev_lock_no["best_effort"]["moves_used"] == 1
+print("slot-evacuation forced-move/tie cases OK")
+
+# 确定性方案 C: 两支 50g 均非锁定(求解器置于对径槽 0/6); 失效其中一管槽,
+# 限值 0 下需 2 支共同迁到新对径对(槽 1/7 等, 并列取目标槽序列最小者)
+ev3_body = dict(ev_body)
+ev3_body["name"] = "应急迁移三"
+ev3_body["tubes"] = [{"id": 1, "mass": 50}, {"id": 2, "mass": 50}]
+recv3 = call("POST", "/api/plan", ev3_body)
+evid3 = recv3["id"]
+assert abs(recv3["result"]["metrics"]["u1_mag_g_mm"]) < 1e-6
+pl3 = {(p["tube_id"], p["slot"]) for p in recv3["result"]["placements"]}
+failed3 = next(p["slot"] for p in recv3["result"]["placements"]
+               if p["tube_id"] == 1)
+# 限值宽松 → 1 支移动即可; 限值 0 → 需要 2 支移动, 最终 |U₁|=0
+ev3_1 = ev_call(evid3, [failed3], 1e9, 3)
+assert ev3_1["feasible"] is True and ev3_1["moves_required"] == 1
+ev_perfect = ev_call(evid3, [failed3], 0.0, 3)
+assert ev_perfect["feasible"] is True and ev_perfect["moves_required"] == 2
+assert abs(ev_perfect["final_u1"]["u1_mag_g_mm"]) < 1e-7
+assert {t["final_slot"] for t in ev_perfect["tubes"]}.isdisjoint({failed3})
+# 并列裁决: 目标槽序列 (管1目标, 管2目标) 字典序最小;
+# 完美对为避开失效槽的全部对径槽对(正反两种分配)
+key = tuple(t["final_slot"] for t in
+            sorted(ev_perfect["tubes"], key=lambda t: t["tube_id"]))
+pairs = [(a, (a + 6) % 12) for a in range(6)
+         if failed3 not in (a, (a + 6) % 12)]
+cands = [c for ab in pairs for c in (ab, ab[::-1])]
+assert key == min(cands), (key, min(cands))
+print("slot-evacuation perfect 2-move tie-break OK")
+
+# 校验错误: 404 / 移动上限越界 / 失效槽不存在 / 失效槽原本禁用 / 17 管超限
+try:
+    ev_call(999, [1], 1.0, 1); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+for bad_ev in (
+    (evid2, [99], 1.0, 1),     # 槽位不存在
+    (2, [6], 1.0, 1),          # 槽 6 在 plan#2 中本就禁用
+    (evid2, [1], 1.0, 4),      # 移动上限超过 3
+    (evid2, [], 1.0, 1),       # 失效槽为空
+    (evid2, [1], -1.0, 1),     # 负限值
+):
+    try:
+        ev_call(*bad_ev); raise SystemExit("should 400")
+    except main.HTTPException as e:
+        assert e.status_code == 400, bad_ev
+try:
+    ev_call(recb["id"], [1], 1.0, 1); raise SystemExit("should 400")
+except main.HTTPException as e:
+    assert e.status_code == 400 and "10" in str(e.detail), e.detail
+# 只读: 规划后三条方案指标均不变
+assert call("GET", f"/api/plan/{evid}")["result"]["metrics"]["u1_mag_g_mm"] == \
+    recv["result"]["metrics"]["u1_mag_g_mm"]
+assert call("GET", f"/api/plan/{evid2}")["result"]["metrics"]["u1_mag_g_mm"] == \
+    recv2["result"]["metrics"]["u1_mag_g_mm"]
+assert call("GET", f"/api/plan/{evid3}")["result"]["metrics"]["u1_mag_g_mm"] == \
+    recv3["result"]["metrics"]["u1_mag_g_mm"]
+print("slot-evacuation validation/read-only OK")
 print("BACKEND SMOKE TESTS PASS")

@@ -205,6 +205,7 @@ th{color:var(--mut);font-weight:500}
       <button id="btnWeighing" disabled title="对已保存方案做称重误差校核(只读)">称重误差校核</button>
       <button id="btnCalib" disabled title="对已保存方案做实测振动校准(只读, 影响系数法)">实测振动校准</button>
       <button id="btnLoading" disabled title="对已保存方案规划逐管安全装载次序(只读, 子集动态规划)">逐管安全装载</button>
+      <button id="btnEvac" disabled title="对已保存方案做失效槽位应急迁移(只读, 精确枚举)">失效槽位应急迁移</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
     </div>
@@ -388,6 +389,37 @@ th{color:var(--mut);font-weight:500}
       </div>
     </div>
     <div id="loadingResult" style="margin-top:6px"></div>
+  </div>
+</div>
+
+<div id="evacDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">失效槽位应急迁移</h2><div style="flex:1"></div>
+      <button id="btnCloseEvac" class="ghost">关闭</button></div>
+    <div class="wc-note">基于该方案的<b>原质量、槽角与半径</b>生成只读迁移建议, 不修改试管质量,
+      结果不保存、不覆盖原方案。<b>锁定试管不得移动</b>, <b>失效槽位不得占用</b>(原本禁用槽同样不可用)。
+      服务端在最多可移动管数上限内, 按移动管数分层<b>精确枚举</b>满足限值的摆放:
+      先使<b>移动管数最少</b>, 再使最终 <b>|U₁| 最小</b>, 并列时按<b>管号升序的目标槽位序列</b>裁决。
+      仅接受至多 <b>10 支管、16 个启用槽位、移动上限 0~3</b> 的方案; 无可行摆放时会明确说明。</div>
+    <div id="evacMeta" class="small" style="margin:4px 0 8px"></div>
+    <div class="rowline" style="gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <div style="flex:1;min-width:200px">
+        <label>新失效槽位(逗号/空格分隔, 必须为原本启用槽)</label>
+        <input id="evFailed" type="text" placeholder="例如 3, 9">
+      </div>
+      <div style="flex:1;min-width:160px">
+        <label>一阶不平衡量限值 |U₁| (g·mm), 必填</label>
+        <input id="evLimit" type="number" min="0" step="any" placeholder="例如 1000">
+      </div>
+      <div style="min-width:150px">
+        <label>最多可移动管数 (0~3)</label>
+        <input id="evMaxMoves" type="number" min="0" max="3" step="1" value="3">
+      </div>
+      <div style="align-self:flex-end">
+        <button id="btnEvRun" class="primary">生成迁移建议</button>
+      </div>
+    </div>
+    <div id="evacResult" style="margin-top:6px"></div>
   </div>
 </div>
 

@@ -19,6 +19,7 @@ from .balancer import run_plan
 from .batch import plan_batch_sequence
 from .calibration import predict_single_weight_balancing
 from .compare import compare_plans
+from .evacuation import plan_slot_evacuation
 from .loading import plan_loading_sequence
 from .weighing import worst_case_u1
 
@@ -120,6 +121,15 @@ class BatchSequenceRequest(BaseModel):
 class LoadingSequenceRequest(BaseModel):
     # 装载阶段一阶不平衡量限值(g·mm), 可空; 非空时必须非负
     u1_limit_g_mm: Optional[float] = Field(default=None, ge=0)
+
+
+class SlotEvacuationRequest(BaseModel):
+    # 新失效槽位索引列表(原本必须启用), 至少 1 个、不重复
+    failed_slots: list[int] = Field(min_length=1)
+    # 一阶不平衡量限值(g·mm), 必填的非负数
+    u1_limit_g_mm: float = Field(ge=0)
+    # 最多可移动管数(0~3, 控制精确枚举的搜索规模)
+    max_moves: int = Field(ge=0, le=3)
 
 
 class PlanRequest(BaseModel):
@@ -460,6 +470,29 @@ def loading_sequence(plan_id: int, req: LoadingSequenceRequest) -> dict[str, Any
     plan = _row_to_plan(_load_plan_row(plan_id))
     try:
         return plan_loading_sequence(plan, u1_limit_g_mm=req.u1_limit_g_mm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/plan/{plan_id}/slot-evacuation")
+def slot_evacuation(plan_id: int, req: SlotEvacuationRequest) -> dict[str, Any]:
+    """对已保存方案做失效槽位应急迁移规划(只读): 基于原质量、槽角与半径。
+
+    锁定试管不得移动, 失效槽位不得占用; 在最多移动 max_moves(0~3) 支
+    非锁定试管的上限内, 按移动管数分层完全枚举(管数 ≤ 10、启用槽 ≤ 16),
+    精确寻找满足一阶不平衡量限值的摆放: 先使移动管数最少, 再使最终
+    |U₁| 最小, 并列时按管号升序的目标槽位序列裁决。返回逐管原槽/目标槽、
+    移动数与最终 |U₁|; 无可行摆放时明确说明, 并附移动上限内 |U₁| 最小
+    的对照摆放。结果不保存、不覆盖原方案。
+    """
+    plan = _row_to_plan(_load_plan_row(plan_id))
+    try:
+        return plan_slot_evacuation(
+            plan,
+            failed_slots=list(req.failed_slots),
+            u1_limit_g_mm=req.u1_limit_g_mm,
+            max_moves=req.max_moves,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

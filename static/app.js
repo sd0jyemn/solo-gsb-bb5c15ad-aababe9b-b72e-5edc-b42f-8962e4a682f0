@@ -255,10 +255,11 @@ function renderResult(record) {
   sum.innerHTML = r.summary;
   $("btnExport").disabled = false;
   $("btnCopy").disabled = false;
-  // 误差校核/振动校准/逐管装载只针对已保存方案: 未保存(草稿)时禁用
+  // 误差校核/振动校准/逐管装载/应急迁移只针对已保存方案: 未保存(草稿)时禁用
   $("btnWeighing").disabled = !(record.id !== null && record.id !== undefined);
   $("btnCalib").disabled = !(record.id !== null && record.id !== undefined);
   $("btnLoading").disabled = !(record.id !== null && record.id !== undefined);
+  $("btnEvac").disabled = !(record.id !== null && record.id !== undefined);
 
   drawRotor(r);
   renderPairs(r);
@@ -480,6 +481,7 @@ async function renderHistory() {
         <button class="iconbtn" data-a="weigh">误差校核</button>
         <button class="iconbtn" data-a="calib">振动校准</button>
         <button class="iconbtn" data-a="loadseq">安全装载</button>
+        <button class="iconbtn" data-a="evac">应急迁移</button>
         <button class="iconbtn" data-a="export">导出</button>
         <button class="iconbtn" data-a="del">删除</button>
       </div>`;
@@ -499,6 +501,7 @@ async function renderHistory() {
     d.querySelector('[data-a="weigh"]').onclick = () => openWeighingDialog(it.id);
     d.querySelector('[data-a="calib"]').onclick = () => openCalibDialog(it.id);
     d.querySelector('[data-a="loadseq"]').onclick = () => openLoadingDialog(it.id);
+    d.querySelector('[data-a="evac"]').onclick = () => openEvacDialog(it.id);
     d.querySelector('[data-a="export"]').onclick = () => { window.location = `/api/plan/${it.id}/export`; };
     d.querySelector('[data-a="del"]').onclick = async () => {
       if (!confirm(`删除方案 #${it.id}?`)) return;
@@ -1191,6 +1194,166 @@ $("btnLoading").onclick = () => {
   }
 };
 $("btnCloseLoading").onclick = () => $("loadingDialog").classList.remove("open");
+
+// ---------------------------------------------------------------------------
+// 失效槽位应急迁移(只读, 基于已保存方案; 按移动数分层精确枚举)
+// ---------------------------------------------------------------------------
+const evacState = { planId: null, tubeCount: 0, enabledCount: 0 };
+
+async function openEvacDialog(id) {
+  $("btnEvac")?.blur();
+  try {
+    const resp = await fetch(`/api/plan/${id}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "方案读取失败");
+    evacState.planId = id;
+    evacState.tubeCount = data.result.placements
+      .filter((p) => p.slot !== null && p.slot !== undefined).length;
+    evacState.enabledCount = data.result.slot_state.filter((s) => s.enabled).length;
+    const tooMany = evacState.tubeCount > 10 || evacState.enabledCount > 16;
+    $("evacMeta").innerHTML =
+      `方案 <b>#${data.id} ${data.name}</b> · ${new Date(data.created_at).toLocaleString()} ·
+       R=${data.request.radius_mm}mm · ${data.result.config.rpm} rpm ·
+       ${evacState.tubeCount} 支已放置试管 / ${evacState.enabledCount} 个启用槽 ·
+       原 |U₁|=${fmt(data.result.metrics.u1_mag_g_mm)} g·mm` +
+      (tooMany ? ' · <span class="wc-hi">超过 10 支管或 16 个启用槽上限, 服务端将拒绝</span>' : "");
+    $("evFailed").value = "";
+    $("evLimit").value = "";
+    $("evMaxMoves").value = "3";
+    $("evacResult").innerHTML = "";
+    $("btnEvRun").disabled = tooMany || evacState.tubeCount === 0;
+    $("evacDialog").classList.add("open");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+$("btnEvRun").onclick = async () => {
+  const btn = $("btnEvRun");
+  btn.disabled = true;
+  try {
+    const failed = $("evFailed").value.split(/[\s,;，；]+/)
+      .map((s) => s.trim()).filter(Boolean).map((s) => {
+        const v = Number(s);
+        if (!Number.isInteger(v) || v < 0) throw new Error("失效槽位必须为非负整数槽号。");
+        return v;
+      });
+    if (!failed.length) { toast("请至少填写一个新失效槽位。", true); return; }
+    const limit = parseFloat($("evLimit").value);
+    if (!(limit >= 0) || !Number.isFinite(limit)) {
+      toast("一阶不平衡量限值必须为非负有限数。", true); return;
+    }
+    const maxMoves = parseInt($("evMaxMoves").value, 10);
+    if (![0, 1, 2, 3].includes(maxMoves)) {
+      toast("最多可移动管数必须为 0~3 的整数。", true); return;
+    }
+    const resp = await fetch(`/api/plan/${evacState.planId}/slot-evacuation`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        failed_slots: failed,
+        u1_limit_g_mm: limit,
+        max_moves: maxMoves,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "迁移规划失败");
+    renderEvacResult(data);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+function renderEvacResult(d) {
+  const box = $("evacResult");
+  const failedTxt = d.failed_slots.map((f) =>
+    `#${f.slot}(${fmt(f.angle_deg, 0)}°)` +
+    (f.occupied_by_tube === null || f.occupied_by_tube === undefined
+      ? '<span class="small">空</span>'
+      : `<span class="small">${f.locked ? "🔒锁定管" : "管"} ${f.occupied_by_tube}</span>`)
+  ).join("、");
+
+  let verdict;
+  if (d.feasible) {
+    verdict = `<div class="wc-ok">✔ <b>存在可行迁移</b>: 最少移动 <b>${d.moves_required}</b> 支试管即可满足限值 —
+      最终 |U₁|=<b>${fmt(d.final_u1.u1_mag_g_mm)}</b> g·mm ≤ 限值 ${fmt(d.u1_limit_g_mm)} g·mm,
+      余量 ${fmt(d.margin_g_mm)} g·mm(迁移前 |U₁|=${fmt(d.original_u1.u1_mag_g_mm)} g·mm)。
+      ${d.tie_broken ? `达到该最优结果的摆放共 ${d.optimal_arrangement_count} 种, 已按管号升序的目标槽位序列裁决。` : "最优摆放唯一。"}</div>`;
+  } else {
+    verdict = `<div class="wc-bad">✘ <b>无可行摆放</b>: ${d.reason}</div>`;
+  }
+
+  const head = `<div class="wc-note">失效槽位: ${failedTxt} · 必须迁移 ${d.forced_move_count} 支(失效槽上非锁定管) ·
+    移动上限 ${d.max_moves} · 精确评估合法摆放 ${d.evaluated_arrangements} 种 ·
+    有效目标槽 ${d.usable_target_slots.length ? d.usable_target_slots.map((s) => `#${s}`).join("、") : "无"}。
+    ${d.locked_on_failed_slots.length
+      ? `<br><span class="wc-hi">锁定试管在失效槽上: ${d.locked_on_failed_slots.map((t) => `管 ${t.tube_id}@槽 ${t.slot}`).join("、")} —— 锁定管不得移动, 结构上不可行。</span>`
+      : ""}</div>`;
+
+  // 展示对象: 可行时用最终摆放; 不可行且有对照摆放时用对照摆放; 都没有则展示原槽
+  const rows = d.tubes.length ? d.tubes : [];
+  const movesSummary = d.moves.length
+    ? `<div class="rowline" style="flex-wrap:wrap;gap:6px;margin:6px 0">
+         <span class="small">移动清单(${d.moves.length}):</span>
+         ${d.moves.map((m) =>
+           `<span class="badge">管 ${m.tube_id}: 槽 ${m.from_slot} → 槽 ${m.to_slot}
+             <span class="small">(${fmt(m.from_angle_deg, 0)}°→${fmt(m.to_angle_deg, 0)}°)</span></span>`
+         ).join("")}
+       </div>`
+    : "";
+  const tableTitle = d.feasible
+    ? "逐管原槽 / 目标槽(只读建议, 不覆盖原方案)"
+    : d.best_effort
+      ? "对照摆放: 移动上限内 |U₁| 最小的摆放(仍不满足限值, 仅供参考)"
+      : "原摆放明细(不存在目标摆放)";
+
+  let finalBlock = "";
+  if (d.final_u1) {
+    finalBlock = `<div class="rowline" style="gap:14px;flex-wrap:wrap;margin:6px 0;font-size:12.5px">
+      <span>迁移前 |U₁|=<b>${fmt(d.original_u1.u1_mag_g_mm)}</b> g·mm @ ${fmt(d.original_u1.u1_angle_deg, 1)}°</span>
+      <span>迁移后 |U₁|=<b class="${d.feasible ? "delta-down" : "delta-up"}">${fmt(d.final_u1.u1_mag_g_mm)}</b> g·mm @ ${fmt(d.final_u1.u1_angle_deg, 1)}°</span>
+      ${d.within_limit === false ? `<span class="delta-up">超出 ${fmt(d.excess_g_mm)} g·mm</span>` : ""}
+    </div>`;
+  }
+
+  const tubeRows = rows.map((t) => {
+    const moved = t.final_slot !== null && t.final_slot !== undefined && t.moved;
+    const target = t.final_slot === null || t.final_slot === undefined
+      ? '<span class="small">— 无目标摆放 —</span>'
+      : moved
+        ? `<b>${t.final_slot}</b> <span class="small">(${fmt(t.final_angle_deg, 1)}°)</span>`
+        : `${t.final_slot} <span class="small">(${fmt(t.final_angle_deg ?? t.original_angle_deg, 1)}°)</span>`;
+    return `<tr${moved ? ' style="background:#3a2a1255"' : ""}>
+      <td>${t.tube_id}${t.locked ? ' <span class="pill lock">锁定</span>' : ""}</td>
+      <td>${fmt(t.mass_g, 3)}</td>
+      <td>${t.original_slot} <span class="small">(${fmt(t.original_angle_deg, 1)}°)</span></td>
+      <td>${target}</td>
+      <td>${moved ? '<span class="status-tag st-moved">移动</span>' : '<span class="status-tag st-unchanged">不动</span>'}</td>
+    </tr>`;
+  }).join("");
+
+  box.innerHTML = `
+    ${verdict}
+    ${head}
+    ${movesSummary}
+    ${finalBlock}
+    <h2 style="font-size:13px;margin:8px 0 6px">${tableTitle}</h2>
+    <table class="cmp-table wc-table">
+      <thead><tr><th>试管</th><th>质量(g)</th><th>原槽 / 角度</th><th>目标槽 / 角度</th><th>状态</th></tr></thead>
+      <tbody>${tubeRows}</tbody>
+    </table>
+    <div class="small" style="margin-top:6px">算法: ${d.method}。${d.note} 方案 #${d.plan.id} 未被修改。</div>`;
+}
+
+$("btnEvac").onclick = () => {
+  if (state.record && state.record.id !== null && state.record.id !== undefined) {
+    openEvacDialog(state.record.id);
+  } else {
+    toast("请先从历史方案载入一条已保存方案, 或先计算并保存方案。", true);
+  }
+};
+$("btnCloseEvac").onclick = () => $("evacDialog").classList.remove("open");
 
 // ---------------------------------------------------------------------------
 // 标签页 & 初始化
